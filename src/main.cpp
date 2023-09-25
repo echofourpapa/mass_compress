@@ -76,7 +76,7 @@ bool ParseArgs(int argc, char* argv[], args_output& out)
     }
     out.input_dir = std::filesystem::path(argv[1]);
 
-    for (uint32 i = 2; i < argc; i++)
+    for (uint32 i = 2; i < (uint32)argc; i++)
     {
         std::string arg(argv[i]);
         for (uint32 j = 0; j < c_optionsCount; j++)
@@ -252,6 +252,7 @@ DXGI_FORMAT ChannelsToFormat(uint32 channels, bool sRGB=false)
             return sRGB ? DXGI_FORMAT_BC7_UNORM_SRGB : DXGI_FORMAT_BC7_UNORM;
         default:
             assert("Invalid Channel Count");
+            return DXGI_FORMAT_UNKNOWN;
     }
 }
 
@@ -263,12 +264,12 @@ uint32 FormatToBlocksize(DXGI_FORMAT format)
         case DXGI_FORMAT_BC1_UNORM_SRGB:
         case DXGI_FORMAT_BC4_UNORM:
             return 8;
+        case DXGI_FORMAT_BC5_UNORM:
         case DXGI_FORMAT_BC7_UNORM:
         case DXGI_FORMAT_BC7_UNORM_SRGB:
-        case DXGI_FORMAT_BC5_UNORM:
-            return 16;
         default:
-            assert("Invalid Format");
+            return 16;
+       
     }
 }
 
@@ -354,7 +355,7 @@ bool IsProbablyNormalMap(const Image& image, uint32 width, uint32 height, uint32
         if (fabs(len - 1.0f) <= qaunt_size)
             lcount++;
     }
-    uint32 high = image.data.size() * 0.95f;
+    uint32 high = (uint32)(image.data.size() * 0.95f);
     float percentage = (float)lcount / (float)image.data.size();
     if (lcount > high)
         return true;
@@ -382,7 +383,7 @@ bool CompressFile(const std::filesystem::path& path, const std::filesystem::path
     fopen_s(&fp, path.string().c_str(), "rb");
     if (!fp)
     {
-        std::printf("Couldn't read file: %s\n", path);
+        std::printf("Couldn't read file: %s\n", path.string().c_str());
         return false;
     }
 
@@ -504,6 +505,13 @@ bool CompressFile(const std::filesystem::path& path, const std::filesystem::path
         channels = 3;
 
     DXGI_FORMAT format = ChannelsToFormat(channels, sRGB);
+
+    if (format == DXGI_FORMAT_UNKNOWN)
+    {
+        std::printf("Couldn't figure out texture format from channel count.  %d is either less than 1 or greater than 4.", channels);
+        return false;
+    }
+
     uint32 blockSize = FormatToBlocksize(format);
 
     // Really silly, RGB textures have to be RGBA for the compressor..... >:[
@@ -597,7 +605,7 @@ bool CompressFile(const std::filesystem::path& path, const std::filesystem::path
         fopen_s(&fp, out_path.string().c_str(), "wb");
         if (!fp)
         {
-            std::printf("Couldn't write file: %s\n", path);
+            std::printf("Couldn't write file: %s\n", path.string().c_str());
             return false;
         }
 
