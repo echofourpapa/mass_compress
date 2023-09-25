@@ -258,6 +258,7 @@ DXGI_FORMAT ChannelsToFormat(uint32 channels, bool sRGB=false)
 
 uint32 FormatToBlocksize(DXGI_FORMAT format)
 {
+    // Almost all formats are 16 bytes per block, only a few are 8 bytes.
     switch (format)
     {
         case DXGI_FORMAT_BC1_UNORM:
