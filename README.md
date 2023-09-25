@@ -13,7 +13,7 @@ The whole thing is really bare bones, a lot of it is probably terrible, use at y
 
 ## Building
 * Clone this repo
-* Clone [ISPC Texture Compressor](https://github.com/GameTechDev/ISPCTextureCompressor) to `thirdparty/`
+* Make sure submodules are pulled to `thirdparty/`
 * * Don't forget to download the ISPC Compiler
 * Run `premake5.exe vs2022`
 * Build the solution `build/Mass Compress.sln` in Visual Studio
