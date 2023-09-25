@@ -1,0 +1,10 @@
+*/x64/
+*/Debug/
+/x64/
+/Debug/
+/Packages/
+/.vs
+/build/
+/bin/
+*.exe
+*.pdb

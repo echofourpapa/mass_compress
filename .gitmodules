@@ -1,0 +1,6 @@
+[submodule "thirdparty/ISPCTextureCompressor"]
+	path = thirdparty/ISPCTextureCompressor
+	url = git@github.com:GameTechDev/ISPCTextureCompressor.git
+[submodule "thirdparty/stb"]
+	path = thirdparty/stb
+	url = git@github.com:nothings/stb.git
