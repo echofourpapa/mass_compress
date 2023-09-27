@@ -308,6 +308,14 @@ struct Pixel
             rgba[c] = rgba[c] > 0.4045f ? pow((rgba[c] + 0.055f) / 1.055f, 2.4f) : rgba[c] / 12.92f;
         }
     }
+
+    void LinearTosRGB()
+    {
+        for (uint32 c = 0; c < 3; c++)
+        {
+            rgba[c] = rgba[c]  > 0.0031308f ? 1.055f * pow(rgba[c], 1.f / 2.4f) - 0.055f : rgba[c] * 12.92f;
+        }
+    }
 };
 
 struct Image
@@ -406,6 +414,11 @@ bool CompressFile(const std::filesystem::path& path, const std::filesystem::path
     uint32 mipCount = (uint32)log2(std::max(width, height)) + 1;
     std::vector<Image> inImgs(mipCount);
 
+    bool isNormal = IsProbablyNormalMap(inImgs[0], width, height, reqChannels) || name.find("Normal") != std::string::npos;
+
+    // I have no idea why sRGB doesn't work the way I want it to...
+    bool sRGB = (name.find("Albedo") != std::string::npos || name.find("BaseColor") != std::string::npos) && !isNormal;
+
     // Make it all floats, colors love floats
     for (uint32 y = 0; y < width; y++)
     {
@@ -417,6 +430,9 @@ bool CompressFile(const std::filesystem::path& path, const std::filesystem::path
             {
                 pixel.rgba[c] = readImg[srcIndex + c] / 255.0f;
             }
+
+            if (sRGB)
+                pixel.sRGBToLinear();
             inImgs[0].data.push_back(pixel);
         }
     }
@@ -424,10 +440,7 @@ bool CompressFile(const std::filesystem::path& path, const std::filesystem::path
     inImgs[0].height = height;
     delete readImg;
 
-    bool isNormal = IsProbablyNormalMap(inImgs[0], width, height, reqChannels) || name.find("Normal") != std::string::npos;
 
-    // I have no idea why sRGB doesn't work the way I want it to...
-    bool sRGB = false;// (name.find("Albedo") != std::string::npos || name.find("BaseColor") != std::string::npos) && !isNormal;
 
     // Make the mips, simple averaging downsample
     for (uint32 mip = 1; mip < mipCount; mip++)
@@ -533,13 +546,14 @@ bool CompressFile(const std::filesystem::path& path, const std::filesystem::path
             {
                 uint32 srcIdx = x + y * mipWidth;
                 uint32 dstIdx = srcIdx * channels;
+
+                Pixel pixel = inImgs[mip].data[srcIdx];
                 if (sRGB)
-                {
-                    inImgs[mip].data[srcIdx].sRGBToLinear();
-                }
+                    pixel.LinearTosRGB();
+
                 for (uint32 c = 0; c < channels; c++)
                 {
-                    smallData[dstIdx + c] = (uint8)(inImgs[mip].data[srcIdx].rgba[c] * 255.0f);
+                    smallData[dstIdx + c] = (uint8)(pixel.rgba[c] * 255.0f);
                 }
             }
         }
