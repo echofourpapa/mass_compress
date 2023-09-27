@@ -305,7 +305,7 @@ struct Pixel
         // Don't scale alpha channels
         for (uint32 c = 0; c < 3; c++)
         {
-            rgba[c] = rgba[c] > 0.4045f ? pow((rgba[c] + 0.055f) / 1.055f, 2.4f) : rgba[c] / 12.92f;
+            rgba[c] = rgba[c] > 0.04045f ? pow((rgba[c] + 0.055f) / 1.055f, 2.4f) : rgba[c] / 12.92f;
         }
     }
 
