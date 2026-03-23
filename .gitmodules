@@ -4,3 +4,6 @@
 [submodule "thirdparty/stb"]
 	path = thirdparty/stb
 	url = git@github.com:nothings/stb.git
+[submodule "thirdparty/compressonator"]
+	path = thirdparty/compressonator
+	url = https://github.com/GPUOpen-Tools/compressonator.git

@@ -1,16 +1,25 @@
 /*
 Mass Compress!
 
-Takes a folder full of textures and compresses all of them, using Intel's ISPC Texture Compressor, and outputs them as .dds files.
-    
-Only works on.tga, .png, and .jpg files for inputs.
-Does it's best to figure out compression formats:
+Takes a folder full of textures and batch-compresses them to BC-format DDS files.
+Supports .tga, .png, and .jpg inputs.
+
+Format selection by channel count:
 * 1 channel  (grayscale)        - BC4
 * 2 channels (normal maps)      - BC5
 * 3 channels (color)            - BC1
 * 4 channels (color and alpha)  - BC7
-    
-The whole thing is really bare bones, a lot of it is probably terrible, use at your own risk!
+
+Normal maps are detected automatically (or by "Normal" in the filename) and
+compressed as BC5. sRGB textures are detected by "Albedo" or "BaseColor" in
+the filename and use sRGB BC format variants.
+
+Three compression backends are available:
+* cmp-cpu (default) - AMD Compressonator CPU path, multi-threaded  (-b=cmp-cpu)
+* ispc               - Intel ISPC Texture Compressor                (-b=ispc)
+* cmp-gpu            - AMD Compressonator GPU path (DirectX compute) (-b=cmp-gpu)
+                       Note: not faster than CPU in practice due to
+                       Compressonator's per-call GPU overhead.
 
 * ----------------------------------------------------------------------------
 * "THE BEER-WARE LICENSE" (Revision 42):
@@ -19,34 +28,40 @@ The whole thing is really bare bones, a lot of it is probably terrible, use at y
 * this stuff is worth it, you can buy me a beer in return.
 * ----------------------------------------------------------------------------
 */
-#include "ispc_texcomp.h"
-#include <iostream>
+#include "Types.h"
+
 #include <cstdio>
 #include <filesystem>
 #include <vector>
+#include <future>
+#include <mutex>
+#include <thread>
+#include <memory>
+#include <string>
+#include <chrono>
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
-typedef signed char int8;
-typedef signed short int16;
-typedef signed int int32;
-typedef __int64 int64;
+#include "DDS.h"
 
-typedef unsigned char uint8;
-typedef unsigned short uint16;
-typedef unsigned int uint32;
-typedef unsigned __int64 uint64;
+#include "Compressor.h"
+#include "CompressorISPC.h"
+#include "CompressorCMP.h"
+#include "CompressorCMP_GPU.h"
 
-const char* c_help = "-h";
-const char* c_helpLong = "--help";
-const uint32 c_optionsCount = 2;
-const char* c_options[c_optionsCount] = { c_help , c_helpLong };
+std::mutex g_printMutex;
+
+enum class BackendType { ISPC, CMP_CPU, CMP_GPU };
 
 struct args_output
 {
     std::filesystem::path input_dir;
     std::filesystem::path output_dir;
+    BackendType backend = BackendType::CMP_CPU;
+    uint32 threadCount = 0;  // 0 = auto (hardware_concurrency)
+    float quality = 0.05f;   // CMP quality, ignored for ISPC
+    bool verbose = false;
 };
 
 void PrintHelpMessage()
@@ -58,185 +73,107 @@ void PrintHelpMessage()
         "\tINPUT_DIR : directory containing images you want to compress.\n" \
         "\tOUTPUT_DIR : directory to output compress images too. If none is provided, it defaults to INPUT_DIR/compressed\n" \
         "Options:\n" \
-        "\t-h,--help : print this help message!\n" \
+        "\t-h,--help                  : print this help message!\n" \
+        "\t-v,--verbose               : print timing info per image and total\n" \
+        "\t-b=<backend>,--backend=    : compression backend (ispc, cmp-cpu, cmp-gpu). Default: cmp-cpu\n" \
+        "\t-t=<N>,--threads=          : number of images to compress in parallel. Default: auto\n" \
+        "\t-q=<F>,--quality=          : compression quality 0.0-1.0 (CMP backends only). Default: 0.05\n" \
         "Description\n" \
-        "Takes a folder full of textures and compresses all of them, using Intel's ISPC Texture Compressor, and outputs them as .dds files. Only works on.tga, .png, and .jpg files for inputs.\nDoes it's best to figure out compression formats:\n"\
-        "\t* 1 channel  (grayscale) \t- BC4\n\t* 2 channels (normal maps) \t- BC5\n\t* 3 channels (color) \t\t- BC1\n\t* 4 channels (color and alpha) \t- BC7\n";
+        "Takes a folder full of textures and compresses all of them and outputs them as .dds files. Only works on.tga, .png, and .jpg files for inputs.\n" \
+        "Does it's best to figure out compression formats:\n"\
+        "\t* 1 channel  (grayscale) \t- BC4\n\t* 2 channels (normal maps) \t- BC5\n\t* 3 channels (color) \t\t- BC1\n\t* 4 channels (color and alpha) \t- BC7\n" \
+        "Backends:\n" \
+        "\tispc    : Intel ISPC Texture Compressor (default)\n" \
+        "\tcmp-cpu : AMD Compressonator (CPU, multi-threaded)\n" \
+        "\tcmp-gpu : AMD Compressonator (GPU, DirectX compute)\n";
     std::printf(helpMsg);
 }
 
-bool ParseArgs(int argc, char* argv[], args_output& out)
+// Returns: 0 = success, 1 = help requested (not an error), -1 = error
+int ParseArgs(int argc, char* argv[], args_output& out)
 {
-
     if (argc < 2)
     {
         std::printf("Missing input directory!\n");
         PrintHelpMessage();
-        return false;
+        return -1;
     }
+
+    // Check if first arg is --help before treating it as input dir
+    {
+        std::string first(argv[1]);
+        if (first == "-h" || first == "--help")
+        {
+            PrintHelpMessage();
+            return 1;
+        }
+    }
+
     out.input_dir = std::filesystem::path(argv[1]);
 
     for (uint32 i = 2; i < (uint32)argc; i++)
     {
         std::string arg(argv[i]);
-        for (uint32 j = 0; j < c_optionsCount; j++)
+
+        if (arg == "-h" || arg == "--help")
         {
-            std::string opt(c_options[j]);
-            if (arg == opt)
+            PrintHelpMessage();
+            return 1;
+        }
+
+        if (arg == "-v" || arg == "--verbose")
+        {
+            out.verbose = true;
+            continue;
+        }
+
+        if (arg.find("--backend=") == 0 || arg.find("-b=") == 0)
+        {
+            std::string val = arg.substr(arg.find('=') + 1);
+            if (val == "ispc")
+                out.backend = BackendType::ISPC;
+            else if (val == "cmp-cpu")
+                out.backend = BackendType::CMP_CPU;
+            else if (val == "cmp-gpu")
+                out.backend = BackendType::CMP_GPU;
+            else
             {
+                std::printf("Unknown backend: %s\n", val.c_str());
                 PrintHelpMessage();
-                return false;
+                return -1;
             }
+            continue;
         }
-        if (out.output_dir.empty() && arg[0] != *"-")
+
+        if (arg.find("--threads=") == 0 || arg.find("-t=") == 0)
         {
-            out.output_dir = std::filesystem::path(argv[i]);
+            std::string val = arg.substr(arg.find('=') + 1);
+            out.threadCount = (uint32)std::stoi(val);
+            continue;
         }
-        if (arg[0] == *"-")
+
+        if (arg.find("--quality=") == 0 || arg.find("-q=") == 0)
+        {
+            std::string val = arg.substr(arg.find('=') + 1);
+            out.quality = std::stof(val);
+            continue;
+        }
+
+        if (arg[0] == '-')
         {
             std::printf("Unrecongized option: %s\n", arg.c_str());
             PrintHelpMessage();
-            return false;
+            return -1;
+        }
+
+        if (out.output_dir.empty())
+        {
+            out.output_dir = std::filesystem::path(argv[i]);
         }
     }
 
-    return true;
+    return 0;
 }
-
-#if !DXGI_FORMAT_DEFINED
-typedef enum DXGI_FORMAT
-{
-    DXGI_FORMAT_UNKNOWN = 0,
-    DXGI_FORMAT_R32G32B32A32_TYPELESS = 1,
-    DXGI_FORMAT_R32G32B32A32_FLOAT = 2,
-    DXGI_FORMAT_R32G32B32A32_UINT = 3,
-    DXGI_FORMAT_R32G32B32A32_SINT = 4,
-    DXGI_FORMAT_R32G32B32_TYPELESS = 5,
-    DXGI_FORMAT_R32G32B32_FLOAT = 6,
-    DXGI_FORMAT_R32G32B32_UINT = 7,
-    DXGI_FORMAT_R32G32B32_SINT = 8,
-    DXGI_FORMAT_R16G16B16A16_TYPELESS = 9,
-    DXGI_FORMAT_R16G16B16A16_FLOAT = 10,
-    DXGI_FORMAT_R16G16B16A16_UNORM = 11,
-    DXGI_FORMAT_R16G16B16A16_UINT = 12,
-    DXGI_FORMAT_R16G16B16A16_SNORM = 13,
-    DXGI_FORMAT_R16G16B16A16_SINT = 14,
-    DXGI_FORMAT_R32G32_TYPELESS = 15,
-    DXGI_FORMAT_R32G32_FLOAT = 16,
-    DXGI_FORMAT_R32G32_UINT = 17,
-    DXGI_FORMAT_R32G32_SINT = 18,
-    DXGI_FORMAT_R32G8X24_TYPELESS = 19,
-    DXGI_FORMAT_D32_FLOAT_S8X24_UINT = 20,
-    DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS = 21,
-    DXGI_FORMAT_X32_TYPELESS_G8X24_UINT = 22,
-    DXGI_FORMAT_R10G10B10A2_TYPELESS = 23,
-    DXGI_FORMAT_R10G10B10A2_UNORM = 24,
-    DXGI_FORMAT_R10G10B10A2_UINT = 25,
-    DXGI_FORMAT_R11G11B10_FLOAT = 26,
-    DXGI_FORMAT_R8G8B8A8_TYPELESS = 27,
-    DXGI_FORMAT_R8G8B8A8_UNORM = 28,
-    DXGI_FORMAT_R8G8B8A8_UNORM_SRGB = 29,
-    DXGI_FORMAT_R8G8B8A8_UINT = 30,
-    DXGI_FORMAT_R8G8B8A8_SNORM = 31,
-    DXGI_FORMAT_R8G8B8A8_SINT = 32,
-    DXGI_FORMAT_R16G16_TYPELESS = 33,
-    DXGI_FORMAT_R16G16_FLOAT = 34,
-    DXGI_FORMAT_R16G16_UNORM = 35,
-    DXGI_FORMAT_R16G16_UINT = 36,
-    DXGI_FORMAT_R16G16_SNORM = 37,
-    DXGI_FORMAT_R16G16_SINT = 38,
-    DXGI_FORMAT_R32_TYPELESS = 39,
-    DXGI_FORMAT_D32_FLOAT = 40,
-    DXGI_FORMAT_R32_FLOAT = 41,
-    DXGI_FORMAT_R32_UINT = 42,
-    DXGI_FORMAT_R32_SINT = 43,
-    DXGI_FORMAT_R24G8_TYPELESS = 44,
-    DXGI_FORMAT_D24_UNORM_S8_UINT = 45,
-    DXGI_FORMAT_R24_UNORM_X8_TYPELESS = 46,
-    DXGI_FORMAT_X24_TYPELESS_G8_UINT = 47,
-    DXGI_FORMAT_R8G8_TYPELESS = 48,
-    DXGI_FORMAT_R8G8_UNORM = 49,
-    DXGI_FORMAT_R8G8_UINT = 50,
-    DXGI_FORMAT_R8G8_SNORM = 51,
-    DXGI_FORMAT_R8G8_SINT = 52,
-    DXGI_FORMAT_R16_TYPELESS = 53,
-    DXGI_FORMAT_R16_FLOAT = 54,
-    DXGI_FORMAT_D16_UNORM = 55,
-    DXGI_FORMAT_R16_UNORM = 56,
-    DXGI_FORMAT_R16_UINT = 57,
-    DXGI_FORMAT_R16_SNORM = 58,
-    DXGI_FORMAT_R16_SINT = 59,
-    DXGI_FORMAT_R8_TYPELESS = 60,
-    DXGI_FORMAT_R8_UNORM = 61,
-    DXGI_FORMAT_R8_UINT = 62,
-    DXGI_FORMAT_R8_SNORM = 63,
-    DXGI_FORMAT_R8_SINT = 64,
-    DXGI_FORMAT_A8_UNORM = 65,
-    DXGI_FORMAT_R1_UNORM = 66,
-    DXGI_FORMAT_R9G9B9E5_SHAREDEXP = 67,
-    DXGI_FORMAT_R8G8_B8G8_UNORM = 68,
-    DXGI_FORMAT_G8R8_G8B8_UNORM = 69,
-    DXGI_FORMAT_BC1_TYPELESS = 70,
-    DXGI_FORMAT_BC1_UNORM = 71,
-    DXGI_FORMAT_BC1_UNORM_SRGB = 72,
-    DXGI_FORMAT_BC2_TYPELESS = 73,
-    DXGI_FORMAT_BC2_UNORM = 74,
-    DXGI_FORMAT_BC2_UNORM_SRGB = 75,
-    DXGI_FORMAT_BC3_TYPELESS = 76,
-    DXGI_FORMAT_BC3_UNORM = 77,
-    DXGI_FORMAT_BC3_UNORM_SRGB = 78,
-    DXGI_FORMAT_BC4_TYPELESS = 79,
-    DXGI_FORMAT_BC4_UNORM = 80,
-    DXGI_FORMAT_BC4_SNORM = 81,
-    DXGI_FORMAT_BC5_TYPELESS = 82,
-    DXGI_FORMAT_BC5_UNORM = 83,
-    DXGI_FORMAT_BC5_SNORM = 84,
-    DXGI_FORMAT_B5G6R5_UNORM = 85,
-    DXGI_FORMAT_B5G5R5A1_UNORM = 86,
-    DXGI_FORMAT_B8G8R8A8_UNORM = 87,
-    DXGI_FORMAT_B8G8R8X8_UNORM = 88,
-    DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM = 89,
-    DXGI_FORMAT_B8G8R8A8_TYPELESS = 90,
-    DXGI_FORMAT_B8G8R8A8_UNORM_SRGB = 91,
-    DXGI_FORMAT_B8G8R8X8_TYPELESS = 92,
-    DXGI_FORMAT_B8G8R8X8_UNORM_SRGB = 93,
-    DXGI_FORMAT_BC6H_TYPELESS = 94,
-    DXGI_FORMAT_BC6H_UF16 = 95,
-    DXGI_FORMAT_BC6H_SF16 = 96,
-    DXGI_FORMAT_BC7_TYPELESS = 97,
-    DXGI_FORMAT_BC7_UNORM = 98,
-    DXGI_FORMAT_BC7_UNORM_SRGB = 99,
-    DXGI_FORMAT_AYUV = 100,
-    DXGI_FORMAT_Y410 = 101,
-    DXGI_FORMAT_Y416 = 102,
-    DXGI_FORMAT_NV12 = 103,
-    DXGI_FORMAT_P010 = 104,
-    DXGI_FORMAT_P016 = 105,
-    DXGI_FORMAT_420_OPAQUE = 106,
-    DXGI_FORMAT_YUY2 = 107,
-    DXGI_FORMAT_Y210 = 108,
-    DXGI_FORMAT_Y216 = 109,
-    DXGI_FORMAT_NV11 = 110,
-    DXGI_FORMAT_AI44 = 111,
-    DXGI_FORMAT_IA44 = 112,
-    DXGI_FORMAT_P8 = 113,
-    DXGI_FORMAT_A8P8 = 114,
-    DXGI_FORMAT_B4G4R4A4_UNORM = 115,
-
-    DXGI_FORMAT_P208 = 130,
-    DXGI_FORMAT_V208 = 131,
-    DXGI_FORMAT_V408 = 132,
-
-
-    DXGI_FORMAT_SAMPLER_FEEDBACK_MIN_MIP_OPAQUE = 189,
-    DXGI_FORMAT_SAMPLER_FEEDBACK_MIP_REGION_USED_OPAQUE = 190,
-
-
-    DXGI_FORMAT_FORCE_UINT = 0xffffffff
-} DXGI_FORMAT;
-#endif
-
-#include "DDS.h"
 
 DXGI_FORMAT ChannelsToFormat(uint32 channels, bool sRGB=false)
 {
@@ -270,7 +207,7 @@ uint32 FormatToBlocksize(DXGI_FORMAT format)
         case DXGI_FORMAT_BC7_UNORM_SRGB:
         default:
             return 16;
-       
+
     }
 }
 
@@ -355,7 +292,7 @@ bool IsProbablyNormalMap(const Image& image, uint32 width, uint32 height, uint32
     uint32 lcount = 0;
 
     float qaunt_size = 2.0f / 256.0f;
-    
+
     for (uint32 p = 0; p < image.data.size(); p++)
     {
         Pixel pix = image.data[p];
@@ -383,15 +320,21 @@ bool IsImageExtension(const std::string& ext)
     return false;
 }
 
-bool CompressFile(const std::filesystem::path& path, const std::filesystem::path& outPath)
+bool CompressFile(const std::filesystem::path& path, const std::filesystem::path& outPath, Compressor& compressor, bool verbose)
 {
     std::string name = std::string(path.filename().string().c_str());
-    std::printf("Compressing Image: %s\n", name.c_str());
+    {
+        std::lock_guard<std::mutex> lock(g_printMutex);
+        std::printf("Compressing Image: %s\n", name.c_str());
+    }
+
+    auto imageStart = std::chrono::high_resolution_clock::now();
 
     FILE* fp;
     fopen_s(&fp, path.string().c_str(), "rb");
     if (!fp)
     {
+        std::lock_guard<std::mutex> lock(g_printMutex);
         std::printf("Couldn't read file: %s\n", path.string().c_str());
         return false;
     }
@@ -438,7 +381,7 @@ bool CompressFile(const std::filesystem::path& path, const std::filesystem::path
     }
     inImgs[0].width = width;
     inImgs[0].height = height;
-    delete readImg;
+    stbi_image_free(readImg);
 
 
 
@@ -522,15 +465,12 @@ bool CompressFile(const std::filesystem::path& path, const std::filesystem::path
 
     if (format == DXGI_FORMAT_UNKNOWN)
     {
+        std::lock_guard<std::mutex> lock(g_printMutex);
         std::printf("Couldn't figure out texture format from channel count.  %d is either less than 1 or greater than 4.", channels);
         return false;
     }
 
     uint32 blockSize = FormatToBlocksize(format);
-
-    // Really silly, RGB textures have to be RGBA for the compressor..... >:[
-    if (format == DXGI_FORMAT_BC1_UNORM || format == DXGI_FORMAT_BC1_UNORM_SRGB)
-        channels = 4;
 
     for (uint32 mip = 0; mip < mipCount; mip++)
     {
@@ -538,64 +478,38 @@ bool CompressFile(const std::filesystem::path& path, const std::filesystem::path
         uint32 mipHeight = inImgs[mip].height;
         uint32 compImgSize = std::max(1u, ((mipWidth + 3) / 4)) * std::max(1u, ((mipHeight + 3) / 4)) * blockSize;
 
-        std::vector<uint8> smallData(mipWidth * mipHeight * channels);
+        // Always pack 4 channels (RGBA) for uniform backend input
+        std::vector<uint8> smallData(mipWidth * mipHeight * 4);
 
         for (uint32 y = 0; y < mipWidth; y++)
         {
             for (uint32 x = 0; x < mipHeight; x++)
             {
                 uint32 srcIdx = x + y * mipWidth;
-                uint32 dstIdx = srcIdx * channels;
+                uint32 dstIdx = srcIdx * 4;
 
                 Pixel pixel = inImgs[mip].data[srcIdx];
                 if (sRGB)
                     pixel.LinearTosRGB();
 
-                for (uint32 c = 0; c < channels; c++)
+                for (uint32 c = 0; c < 4; c++)
                 {
                     smallData[dstIdx + c] = (uint8)(pixel.rgba[c] * 255.0f);
                 }
             }
         }
 
-        rgba_surface comp_surf = {};
-        comp_surf.width = mipWidth;
-        comp_surf.height = mipHeight;
-        comp_surf.stride = mipWidth * channels * sizeof(uint8);
-        comp_surf.ptr = &smallData.front();
-
         outImgs[mip].resize(compImgSize);
 
-        switch (format)
+        if (!compressor.CompressMip(smallData.data(), mipWidth, mipHeight, format, outImgs[mip]))
         {
-        case DXGI_FORMAT_BC1_UNORM:
-        case DXGI_FORMAT_BC1_UNORM_SRGB:
-        {
-            CompressBlocksBC1(&comp_surf, &outImgs[mip].front());
-        }
-        break;
-        case DXGI_FORMAT_BC7_UNORM:
-        case DXGI_FORMAT_BC7_UNORM_SRGB:
-        {
-            bc7_enc_settings settings = {};
-            GetProfile_slow(&settings);
-            CompressBlocksBC7(&comp_surf, &outImgs[mip].front(), &settings);
-        }
-        break;
-        case DXGI_FORMAT_BC4_UNORM:
-        {
-            CompressBlocksBC4(&comp_surf, &outImgs[mip].front());
-        }
-        break;
-        case DXGI_FORMAT_BC5_UNORM:
-        {
-            CompressBlocksBC5(&comp_surf, &outImgs[mip].front());
-        }
-        break;
-        default:
-            assert("Invalid Format");
+            std::lock_guard<std::mutex> lock(g_printMutex);
+            std::printf("Failed to compress mip %d of %s\n", mip, name.c_str());
+            return false;
         }
     }
+
+    compressor.OnImageComplete();
 
     DirectX::DDS_HEADER header = {};
     header.size = 124;
@@ -620,6 +534,7 @@ bool CompressFile(const std::filesystem::path& path, const std::filesystem::path
         fopen_s(&fp, out_path.string().c_str(), "wb");
         if (!fp)
         {
+            std::lock_guard<std::mutex> lock(g_printMutex);
             std::printf("Couldn't write file: %s\n", path.string().c_str());
             return false;
         }
@@ -633,6 +548,15 @@ bool CompressFile(const std::filesystem::path& path, const std::filesystem::path
 
         fclose(fp);
     }
+
+    if (verbose)
+    {
+        auto imageEnd = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(imageEnd - imageStart).count();
+        std::lock_guard<std::mutex> lock(g_printMutex);
+        std::printf("  %s: %.1f ms\n", name.c_str(), ms);
+    }
+
     return true;
 }
 
@@ -640,10 +564,11 @@ int main(int argc, char* argv[])
 {
 
     args_output args;
-    if (!ParseArgs(argc, argv, args))
-        return EXIT_FAILURE;
+    int parseResult = ParseArgs(argc, argv, args);
+    if (parseResult != 0)
+        return parseResult < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 
-    if (args.output_dir.empty()) 
+    if (args.output_dir.empty())
     {
         args.output_dir = args.input_dir / "compressed";
     }
@@ -671,12 +596,92 @@ int main(int argc, char* argv[])
         std::printf("No files in \"%s\" to compress.", args.input_dir.string().c_str());
         return EXIT_FAILURE;
     }
+
+    // Create the compression backend
+    std::unique_ptr<Compressor> compressor;
+    const char* backendName = "unknown";
+    switch (args.backend)
+    {
+    case BackendType::ISPC:
+        compressor = std::make_unique<CompressorISPC>();
+        backendName = "ISPC";
+        break;
+    case BackendType::CMP_CPU:
+        compressor = std::make_unique<CompressorCMP>(args.quality);
+        backendName = "CMP CPU";
+        break;
+    case BackendType::CMP_GPU:
+        compressor = std::make_unique<CompressorCMP_GPU>(args.quality);
+        backendName = "CMP GPU";
+        break;
+    }
+    compressor->Init();
+
+    if (args.verbose)
+        std::printf("Backend: %s\n", backendName);
+
+    auto totalStart = std::chrono::high_resolution_clock::now();
+
     bool success = true;
 
-    for (const auto& path : paths)
+    if (compressor->SupportsParallelFiles())
     {
-        if (!CompressFile(path, args.output_dir))
-            success = false;
+        uint32 maxThreads = args.threadCount;
+        if (maxThreads == 0)
+            maxThreads = std::max(1u, (uint32)std::thread::hardware_concurrency());
+
+        std::vector<std::future<bool>> futures;
+
+        for (const auto& path : paths)
+        {
+            // Throttle: wait for a slot if we're at max capacity
+            while (futures.size() >= maxThreads)
+            {
+                bool found = false;
+                for (auto it = futures.begin(); it != futures.end(); ++it)
+                {
+                    if (it->wait_for(std::chrono::milliseconds(0)) == std::future_status::ready)
+                    {
+                        if (!it->get()) success = false;
+                        futures.erase(it);
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found)
+                {
+                    // None ready yet, wait for the first one
+                    if (!futures.front().get()) success = false;
+                    futures.erase(futures.begin());
+                }
+            }
+
+            futures.push_back(std::async(std::launch::async, CompressFile, path, args.output_dir, std::ref(*compressor), args.verbose));
+        }
+
+        // Wait for remaining
+        for (auto& f : futures)
+        {
+            if (!f.get()) success = false;
+        }
+    }
+    else
+    {
+        // Sequential processing (GPU backend parallelizes internally)
+        for (const auto& path : paths)
+        {
+            if (!CompressFile(path, args.output_dir, *compressor, args.verbose))
+                success = false;
+        }
+    }
+
+    compressor->Shutdown();
+
+    if (args.verbose)
+    {
+        auto totalEnd = std::chrono::high_resolution_clock::now();
+        double totalMs = std::chrono::duration<double, std::milli>(totalEnd - totalStart).count();
+        std::printf("Total: %.1f ms\n", totalMs);
     }
 
     std::printf("Complete\n");
